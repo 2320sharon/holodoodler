@@ -2,9 +2,11 @@
 import datetime
 import json
 import logging
+import os
 import pathlib
 import time
-from typing import List, Optional, Tuple
+
+from typing import List, Optional
 
 # External dependencies imports
 import holoviews as hv
@@ -13,11 +15,17 @@ import numpy as np
 import pandas as pd
 import param
 import panel as pn
+import tifffile
 import PIL
 from PIL import ImageDraw
+from PIL import Image
 
-from .segmentation.annotations_to_segmentations import label_to_colors
-from .segmentation.image_segmentation import segmentation
+# from .segmentation.annotations_to_segmentations import label_to_colors
+# from .segmentation.image_segmentation import segmentation
+
+from doodler_engine.annotations_to_segmentations import segmentation, check_sanity
+from doodler_engine.annotations_to_segmentations import label_to_colors
+
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +47,7 @@ class Toggle(pn.reactive.ReactiveHTML):
     color = param.String(doc='Color of the border in hex format')
 
     _template = """
-    <button id="button" style="border-color:{{ color }};border-width:4px;border-radius:5%;padding-inline:10px;font-weight:{{ 'bold' if active else 'normal' }}" onclick="${_update}">
+    <button id="button" style="text-decoration: {{ 'underline' if active else 'normal' }};border-color:{{ color }};border-width:4px;border-radius:5%;padding:10px;font-weight:{{ 'bold' if active else 'normal' }}" onclick="${_update}">
         {{ klass }}
     </button>"""
 
@@ -47,8 +55,10 @@ class Toggle(pn.reactive.ReactiveHTML):
         'active': """
         if (data.active) {
             button.style.fontWeight = "bold"
+            button.style.textDecoration = "underline"
         } else {
             button.style.fontWeight = "normal"
+            button.style.textDecoration = null
         }
         """
     }
@@ -222,6 +232,16 @@ class DoodleDrawer(pn.viewable.Viewer):
         self._drawn_pipe.event(data=[])
         self._draw_stream.event(data={})
 
+    def within(self, bbox):
+        """
+        Return True if the doodles are all within the given bounding box.
+        """
+        l, b, r, t = bbox
+        for d in self.doodles:
+            if d['x'].min() < l or d['x'].max() > r or d['y'].min() < b or d['y'].max() > t:
+                return False
+        return True
+
     @property
     def classes(self):
         return list(self.class_color_mapping.keys())
@@ -240,44 +260,6 @@ class DoodleDrawer(pn.viewable.Viewer):
             self._accumulate_drawn_lines()
         return self._accumulated_lines
 
-# The geometry of the doodles obtained from DoodleDrawer is defined by a series
-# of points referenced in a given coordinate system. What we want is to turn the
-# doodles into a mask (each class being represented by an integer) whose dimension
-# is equal to the dimension of the image the doodles will be associated with.
-# The following functions allow to create such a mask from the doodles.
-
-
-def _project_line_dimension(s: pd.Series, cur_range, target_range) -> pd.Series:
-    """Project the dimension of a line. E.g. if x coordinates in an image whose
-    x range is [0, 1] to an image with an x range of [0, 100].
-    """
-    assert ((cur_range[0] <= s) & (s <= cur_range[1])).all()
-    assert cur_range[0] < cur_range[1]
-    assert target_range[0] < target_range[1]
-    return target_range[0] + (target_range[1] - target_range[0]) * (s - cur_range[0]) / (cur_range[1] - cur_range[0])
-
-
-def project_doodles(
-    doodles: List[pd.DataFrame],
-    x_cur_range: Tuple[float, float],
-    y_cur_range: Tuple[float, float],
-    x_target_range: Tuple[int, int],
-    y_target_range: Tuple[int, int],
-) -> List[pd.DataFrame]:
-    """Project and rescale the doodles from HoloViews to PIL
-    """
-    projected = []
-    for df_doodle in doodles:
-        df_proj = df_doodle.copy()
-
-        df_proj['x_proj'] = _project_line_dimension(df_proj['x'], x_cur_range, x_target_range)
-        df_proj['y_proj'] = _project_line_dimension(df_proj['y'], y_cur_range, y_target_range)
-
-        # Because the origin is bottom left in bokeh and top left in PIL
-        df_proj['y_proj'] = y_target_range[1] - df_proj['y_proj']
-        projected.append(df_proj)
-    return projected
-
 
 def doodles_as_array(
     doodles: List[pd.DataFrame],
@@ -292,7 +274,7 @@ def doodles_as_array(
     for doodle in doodles:
         # Project each line from the bokeh coordinate system to the one required to create them with PIL.
         # List of vertices (x, y)
-        vertices = list(doodle[['x_proj', 'y_proj']].itertuples(index=False, name=None))
+        vertices = list(doodle[['x', 'y']].itertuples(index=False, name=None))
         # There's a unique width per line
         line_width = doodle.loc[0, 'line_width']
         # Index of the colomap + 1
@@ -312,57 +294,67 @@ class InputImage(param.Parameterized):
 
     # UI elements
 
-    location = param.Selector(label='Input image (.JPEG)', doc='Current image path')
+    location = param.Selector(label='Input image (.JPEG or .TIFF)', doc='Current image path')
 
-    # Internal parameters
+    # Internal
 
-    width = param.Integer(default=600, precedence=-1, doc='Image width')
+    img_bounds = param.NumericTuple(None, length=4, doc='Bounding box in pixels.')
 
     def __init__(self, **params):
         super().__init__(**params)
-        self._pane = pn.pane.HoloViews()
+        self._pane = pn.pane.HoloViews(sizing_mode='scale_height', min_height=300)
         self._load_image()
 
     @classmethod
     def from_folder(cls, imgs_folder, **params):
-        """Return a list of JPG and JPEG images in a folder (not recursively).
+        """Return a list of JPG, JPEG, TIF, or TIFF images in a folder (not recursively).
         """
-        jpegs = [
+        imfiles = [
             p
             for p in pathlib.Path(imgs_folder).iterdir()
-            if p.is_file() and p.suffix in ('.jpg', '.jpeg')
+            if p.is_file() and p.suffix.lower() in ('.jpg', '.jpeg', '.tif', '.tiff')
         ]
-        jpegs = sorted(jpegs)
+        imfiles = sorted(imfiles)
         input_image = cls(**params)
-        input_image.param.location.objects = jpegs
-        input_image.location = jpegs[0]
+        input_image.param.location.objects = imfiles
+        input_image.location = imfiles[0]
         return input_image
 
     @staticmethod
     def read_from_fs(path) -> np.ndarray:
-        """Read a JPEG as an Numpy array.
+        """Read tif or jpeg as an nd np array.
         """
-        img = PIL.Image.open(path)
-        nb_bands = len(img.getbands())
-        if nb_bands not in (3, 4):
-            raise ValueError(f'The input image "{path}" has a {nb_bands} channel(s), only JPEG with 3 or 4 channels are supported.')
-        # Some JPEG files follow the CMYK model instead of RGB
-        if nb_bands == 4:
-            img = img.convert('RGB')
+        _, ext = os.path.splitext(path)
+
+        if ext.lower() in ('.jpg', '.jpeg'):
+            img = Image.open(path)
+            if img.mode == 'CMYK':
+                img = img.convert('RGB')
+        elif ext.lower() in ('.tif', '.tiff'):
+            img = tifffile.imread(path)
         arr = np.array(img)
+        # array is (nrows, ncols, nbands)
         return arr
 
     @param.depends('location', watch=True)
     def _load_image(self):
         if not self.location:
-            self.plot = hv.RGB(data=[]).opts(frame_width=self.width)
-            self._pane.object = self.plot
+            self._plot = self._pane.object = hv.RGB(data=[])
             return
         self.array = array = self.read_from_fs(self.location)
-        h, w, _ = array.shape
+        # this is where we want to split the image array used for doodling
+        # and the n-band array for segmentation
+        h, w, nbands = array.shape
+        if nbands > 3:
+            img = array[:, :, 0:3].copy()
+        else:
+            img = array.copy()
+
+        self.img_bounds = (0, 0, w, h)
         # Preserve the aspect ratio
-        self.plot = hv.RGB(array, bounds=(-1, -1, 1, 1)).opts(frame_width=self.width, aspect=w/h)
-        self._pane.object = self.plot
+        self._plot = self._pane.object = hv.RGB(
+            img, bounds=self.img_bounds
+        ).opts(aspect=(w / h))
 
     def remove_img(self):
         """Remove the current image and get the next one if available.
@@ -380,7 +372,17 @@ class InputImage(param.Parameterized):
             self.location = None
 
     @property
+    def plot(self):
+        """
+        RGB HoloViews element of the selected image.
+        """
+        return self._plot
+
+    @property
     def pane(self):
+        """
+        Panel HoloViews pane.
+        """
         return self._pane
 
 
@@ -409,7 +411,8 @@ class ComputationSettings(pn.viewable.Viewer):
 
     crf_downsample_factor = param.Integer(default=2, bounds=(1, 6), label="CRF downsample factor", precedence=1)
 
-    gt_prob = param.Number(default=0.9, bounds=(0.5, 0.99), step=0.1, label="Probability of doodle", precedence=1)
+    ## no need for this paramater with doodler-engine
+    # gt_prob = param.Number(default=0.9, bounds=(0.5, 0.99), step=0.1, label="Probability of doodle", precedence=1)
 
     # Classifier settings
 
@@ -515,12 +518,12 @@ class Application(param.Parameterized):
     canvas_width = param.Integer(default=600)
 
     def __init__(self, **params):
-        self._img_pane = pn.pane.HoloViews()
+        self._img_pane = pn.pane.HoloViews(sizing_mode='scale_height')
         super().__init__(**params)
 
     # Overlay the plot and the drawer on top of each other
     def _init_img_pane(self):
-        self._img_pane.object = self.input_image.plot * self.doodle_drawer.plot
+        self._img_pane.object = (self.input_image.plot * self.doodle_drawer.plot).opts(responsive='height')
 
     @param.depends('input_image.location', watch=True)
     def _reset(self):
@@ -545,6 +548,9 @@ class Application(param.Parameterized):
         if not doodles:
             self.info.update('Draw doodles before trying to run the algorithm.', 'danger')
             return
+        # if not self.doodle_drawer.within(self.input_image.img_bounds):
+        #     self.info.update('At least a doodle was found to be drawn outside of the image bounds.', 'danger')
+        #     return
         if not self.input_image.location:
             self.info.update('Input image not loaded.', 'danger')
             return
@@ -554,17 +560,9 @@ class Application(param.Parameterized):
             self.info.update('Start...')
 
             self.info.add('Projecting/Converting doodles into a mask...')
-            img_height, img_width, _ = self.input_image.array.shape
-            projected_doodles = project_doodles(
-                doodles,
-                x_cur_range=self.input_image.plot.range('x'),
-                y_cur_range=self.input_image.plot.range('y'),
-                x_target_range=(0, img_width),
-                y_target_range=(0, img_height),
-            )
-            # Get a mask with the doodles
+            _, _, img_width, img_height = self.input_image.img_bounds
             self._mask_doodles = doodles_as_array(
-                projected_doodles,
+                doodles,
                 img_width=img_width,
                 img_height=img_height,
                 colormap=self.doodle_drawer.colormap,
@@ -572,22 +570,57 @@ class Application(param.Parameterized):
 
             # Long computation...
             self.info.add('Core segmentation computation...')
+            ## DB: this function now takes new arguments, and a different order
+            ## **self.settings.as_dict() may be considered good practice, but it obscures inputs 
+            ## and makes things harder for me to debug. I've rather just see the inputs spelled out
+            ## in the correct order so I know for sure. 
+
+            # self._segmentation = segmentation(
+            #     img=self.input_image.array,
+            #     mask=self._mask_doodles,
+            #     **self.settings.as_dict(),
+            # )
             self._segmentation = segmentation(
                 img=self.input_image.array,
                 mask=self._mask_doodles,
-                **self.settings.as_dict(),
+                crf_theta_slider_value=self.settings.as_dict()['crf_theta'],
+                crf_mu_slider_value = self.settings.as_dict()['crf_mu'],
+                rf_downsample_value = self.settings.as_dict()['rf_downsample_value'],
+                crf_downsample_factor = self.settings.as_dict()['crf_downsample_factor'],
+                n_sigmas = self.settings.as_dict()['n_sigmas'],
+                multichannel = self.settings.as_dict()['multichannel'],
+                intensity = self.settings.as_dict()['intensity'],
+                edges = self.settings.as_dict()['edges'],
+                texture = self.settings.as_dict()['texture'],
+                sigma_min = self.settings.as_dict()['sigma_min'],
+                sigma_max = self.settings.as_dict()['sigma_max']
             )
 
+            ## new function of the doodler-engine
+            self._segmentation = check_sanity(self._segmentation,self._mask_doodles)
+            self._segmentation = np.flipud(self._segmentation)
+
             self.info.add('Colorizing the segmentation...')
+            ## DB: New version requires "alpha" and "do_alpha"
+            # self._segmentation_color = label_to_colors(
+            #     self._segmentation,
+            #     self.input_image.array[:, :, 0] == 0,
+            #     colormap=self.doodle_drawer.colormap,
+            #     color_class_offset=-1,
+            # )
             self._segmentation_color = label_to_colors(
                 self._segmentation,
                 self.input_image.array[:, :, 0] == 0,
                 colormap=self.doodle_drawer.colormap,
                 color_class_offset=-1,
+                alpha=128,
+                do_alpha=True
             )
 
             self.info.add('Rendering the results...')
-            hv_segmentation_color = hv.RGB(self._segmentation_color, bounds=(-1, -1, 1, 1)).opts(alpha=0.5)
+            hv_segmentation_color = hv.RGB(
+                self._segmentation_color, bounds=self.input_image.img_bounds
+            ).opts(alpha=0.5, responsive='height')
             self._img_pane.object = self._img_pane.object * hv_segmentation_color
             duration = round(time.time() - start_time, 1)
             self.info.add(f'Process done in {duration}s.')
