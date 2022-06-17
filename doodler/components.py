@@ -518,6 +518,7 @@ class Application(param.Parameterized):
         self._img_pane = pn.pane.HoloViews()
         super().__init__(**params)
 
+    # Overlay the plot and the drawer on top of each other
     def _init_img_pane(self):
         self._img_pane.object = self.input_image.plot * self.doodle_drawer.plot
 
