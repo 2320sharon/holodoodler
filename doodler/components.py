@@ -519,6 +519,7 @@ class Application(param.Parameterized):
 
     def __init__(self, **params):
         self._img_pane = pn.pane.HoloViews(sizing_mode='scale_height')
+        # self._img_pane = pn.pane.HoloViews(sizing_mode='scale_both')
         super().__init__(**params)
 
     # Overlay the plot and the drawer on top of each other
@@ -580,6 +581,11 @@ class Application(param.Parameterized):
             #     mask=self._mask_doodles,
             #     **self.settings.as_dict(),
             # )
+            print("\n self.input_image.array",type(self.input_image.array))
+            print("\n self.input_image.array",self.input_image.array)
+            print("\n self._mask_doodles",type(self._mask_doodles))
+            print("\n self._mask_doodles",self._mask_doodles)
+
             self._segmentation = segmentation(
                 img=self.input_image.array,
                 mask=self._mask_doodles,
@@ -596,6 +602,12 @@ class Application(param.Parameterized):
                 sigma_max = self.settings.as_dict()['sigma_max']
             )
 
+            print("\n Check sanity: segmentation",self._segmentation)
+            print("\n Check sanity: shape segmentation",self._segmentation.shape)
+            print("\n Check sanity: type segmentation",type(self._segmentation))
+            print("\n Check sanity: segmentation",np.unique(self._segmentation))
+            print("\n Check sanity: mask_doodles",self._mask_doodles)
+            print("\n Check sanity: mask_doodles",np.unique(self._mask_doodles))
             ## new function of the doodler-engine
             self._segmentation = check_sanity(self._segmentation,self._mask_doodles)
             self._segmentation = np.flipud(self._segmentation)
@@ -616,7 +628,6 @@ class Application(param.Parameterized):
                 alpha=128,
                 do_alpha=True
             )
-
             self.info.add('Rendering the results...')
             hv_segmentation_color = hv.RGB(
                 self._segmentation_color, bounds=self.input_image.img_bounds
